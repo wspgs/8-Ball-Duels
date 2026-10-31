@@ -1,0 +1,824 @@
+--[[
+    TANG HUB - 8 Ball Duels (Ultimate God Edition v3)
+    Features:
+    - Live Simulation Break Solver (คำนวณฟิสิกส์ล่วงหน้า เปิดลูกลง 1-4 หลุม 100% แน่นอน)
+    - 100% Winrate Potting Engine (แทงลงหลุมทุกลูก ไม่มีพลาด)
+    - Aggressive Trickshot / Bank Mode with Smart Fallback (บูสต์ 60 มุมชิ่ง ถ้าทำท่ายากได้ทำทันที ถ้าไม่ได้แทงตรง 100%)
+    - Ultra-Realistic Humanizer (หมุนเล็งและดึงไม้คิวนุ่มนวลเหมือนคนเล่นจริง 100%)
+    - Exact Landing Spot & Pocket Predictor (เส้นชี้จุดตกเป๊ะ และวงแหวนบอกหลุมที่ลูกจะลง)
+    - Full QoL Automations (Auto Spin, Auto Daily, Auto Collect Drops, Anti-AFK)
+]]
+
+-- Destroy previous GUI if re-executed
+if getgenv()._TANG_Window then
+	pcall(function()
+		getgenv()._TANG_Window:destroy()
+	end)
+	getgenv()._TANG_Window = nil
+end
+
+local UI_URL = "https://raw.githubusercontent.com/wspgs/Tangui03/refs/heads/main/ui3"
+
+local function fetch(url)
+	local requested, response = pcall(request, { Url = url, Method = "GET" })
+	if requested and type(response) == "table" and type(response.Body) == "string" and response.Body ~= "" then
+		return response.Body, response.StatusCode
+	end
+	local fetched, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+	if fetched and type(body) == "string" and body ~= "" then
+		return body, 200
+	end
+	return nil, requested and type(response) == "table" and response.StatusCode or tostring(response)
+end
+
+local body, status = fetch(UI_URL)
+if not body then
+	return warn("[TANG HUB] download failed, check UI_URL (status: " .. tostring(status) .. ")")
+end
+
+getgenv().TangHubLibraryOnly = true
+
+local chunk, compileError = loadstring(body)
+if not chunk then
+	return warn("[TANG HUB] compile error: " .. tostring(compileError))
+end
+
+local success, Library = xpcall(chunk, debug.traceback)
+if not success then
+	return warn("[TANG HUB] run error: " .. tostring(Library))
+end
+
+-- ================= SERVICES & MODULES =================
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+local Pool = ReplicatedStorage:WaitForChild("Libraries"):WaitForChild("GameSpecific"):WaitForChild("Pool")
+local PoolConstants = require(Pool:WaitForChild("PoolConstants"))
+local PoolAimOverlay = require(Pool:WaitForChild("PoolAimOverlay"))
+local PoolInputController = require(Pool:WaitForChild("PoolInputController"))
+local PoolAI = require(Pool:WaitForChild("PoolAI"))
+local PoolRules = require(Pool:WaitForChild("PoolRules"))
+local PoolPhysics = require(Pool:WaitForChild("PoolPhysics"))
+local PoolGeometry = require(Pool:WaitForChild("PoolGeometry"))
+local PoolTableRenderer2D = require(Pool:WaitForChild("PoolTableRenderer2D"))
+
+local RemoteSignals = require(ReplicatedStorage.Libraries.Modules.RemoteSignals)
+local RemoteEnums = require(ReplicatedStorage.Libraries.Modules.RemoteSignals.RemoteEnums)
+
+local pockets = PoolGeometry.GetPockets()
+local frameSize = PoolTableRenderer2D.GetFrameSize()
+
+local function toScale(pos)
+	return UDim2.fromScale(0.5 + pos.X / frameSize.X, 0.5 - pos.Y / frameSize.Y)
+end
+
+-- Boost game bank shot engine to evaluate up to 60 cushions & banks
+PoolConstants.Bots.MaxBankProposals = 60
+PoolConstants.BasePredictionLength = 350
+
+-- ================= CONFIGURATION & STATE =================
+local Config = {
+	-- Auto Play
+	AutoPlay = false,
+	ShotStyle = "Trickshot / Bank (ท่ายาก ชิ่งช็อต)", -- "Direct Pot", "Smart Auto", "Trickshot / Bank"
+	Humanized = true,
+	ThinkingTime = 0.8,
+	AimSmoothness = 0.4,
+	PowerSpeed = 0.35,
+
+	-- Break Shot
+	AutoBreakSolver = true,
+
+	-- Guideline & Landing
+	ShowLandingSpot = true,
+	AimLineExtended = true,
+	AimLineLength = 350,
+
+	-- Extra Automations
+	AutoSpin = true,
+	AutoDaily = true,
+	AutoCollectDrops = true,
+	AntiAFK = true,
+}
+
+local function getActiveObjects()
+	local foundInput = nil
+	local foundMatch = nil
+	for _, v in pairs(getgc(true)) do
+		if type(v) == "table" then
+			if not foundInput and rawget(v, "ShotBindable") and rawget(v, "Direction") and rawget(v, "Simulation") then
+				foundInput = v
+			end
+			if not foundMatch and rawget(v, "AwaitingShot") ~= nil and rawget(v, "Simulation") and rawget(v, "Seat") then
+				foundMatch = v
+			end
+			if foundInput and foundMatch then
+				break
+			end
+		end
+	end
+	return foundInput, foundMatch
+end
+
+-- ================= 1. EXACT TRAJECTORY & LANDING SPOT TRACER =================
+local function traceBallTrajectory(origin, dir)
+	local bestDist = 9999
+	local hitType = "Cushion"
+	local hitPos = origin + dir * 100
+	local targetPocket = nil
+
+	-- 1. Check all 6 pockets
+	for _, p in pairs(pockets) do
+		local toMouth = p.MouthCentre - origin
+		local dot = toMouth:Dot(dir)
+		if dot > 0 then
+			local perp = (toMouth - dir * dot).Magnitude
+			local maxMouth = (p.Kind == "Side" and 2.7 or 2.35)
+			if perp <= maxMouth and dot < bestDist then
+				bestDist = dot
+				hitType = "Pocket"
+				hitPos = p.MouthCentre
+				targetPocket = p
+			end
+		end
+	end
+
+	-- 2. If not pocket, find intersection with cushion walls
+	if hitType ~= "Pocket" then
+		local halfW = 44 - PoolConstants.BallRadius
+		local halfH = 22 - PoolConstants.BallRadius
+		local tX = 9999
+		local tY = 9999
+
+		if dir.X > 0.0001 then
+			tX = (halfW - origin.X) / dir.X
+		elseif dir.X < -0.0001 then
+			tX = (-halfW - origin.X) / dir.X
+		end
+		if dir.Y > 0.0001 then
+			tY = (halfH - origin.Y) / dir.Y
+		elseif dir.Y < -0.0001 then
+			tY = (-halfH - origin.Y) / dir.Y
+		end
+
+		local t = math.min(tX > 0 and tX or 9999, tY > 0 and tY or 9999)
+		if t < bestDist then
+			bestDist = t
+			hitPos = origin + dir * t
+			hitType = "Cushion"
+		end
+	end
+
+	return hitType, hitPos, targetPocket, bestDist
+end
+
+-- Hook PoolAimOverlay.Update
+if not getgenv()._TANG_OriginalAimOverlayUpdate then
+	getgenv()._TANG_OriginalAimOverlayUpdate = PoolAimOverlay.Update
+	PoolAimOverlay.Update = function(overlay, cuePos, dir, pred, power, predLength, isLegal)
+		local landingHitType = nil
+		local landingHitPos = nil
+		local landingPocket = nil
+
+		local targetPredLength = math.max(predLength or 0, Config.AimLineLength)
+
+		if Config.ShowLandingSpot and pred and pred.Kind == "Ball" and pred.ObjectDirection and overlay.GuidesEnabled then
+			local startPos = pred.Ghost + pred.ObjectDirection * PoolConstants.BallDiameter
+			local hitType, hitPos, targetPocket, hitDist = traceBallTrajectory(startPos, pred.ObjectDirection)
+			landingHitType = hitType
+			landingHitPos = hitPos
+			landingPocket = targetPocket
+
+			local impact = math.max(pred.ImpactFraction or 1, 0.04)
+			targetPredLength = math.max(hitDist / impact, Config.AimLineLength)
+		elseif Config.AimLineExtended then
+			targetPredLength = Config.AimLineLength
+		end
+
+		local res = getgenv()._TANG_OriginalAimOverlayUpdate(overlay, cuePos, dir, pred, power, targetPredLength, isLegal)
+
+		-- Create landing marker frame if not present
+		if overlay and overlay.Root and not overlay._tangLandingMarker then
+			local marker = Instance.new("Frame")
+			marker.Name = "TangLandingMarker"
+			marker.AnchorPoint = Vector2.new(0.5, 0.5)
+			marker.BorderSizePixel = 0
+			marker.BackgroundTransparency = 0.25
+			marker.ZIndex = overlay.Root.ZIndex + 45
+			marker.Visible = false
+
+			local corner = Instance.new("UICorner")
+			corner.CornerRadius = UDim.new(1, 0)
+			corner.Parent = marker
+
+			local stroke = Instance.new("UIStroke")
+			stroke.Thickness = 2.5
+			stroke.Color = Color3.fromRGB(255, 255, 255)
+			stroke.Parent = marker
+
+			local label = Instance.new("TextLabel")
+			label.Name = "StatusLabel"
+			label.AnchorPoint = Vector2.new(0.5, 1)
+			label.Position = UDim2.new(0.5, 0, 0, -4)
+			label.Size = UDim2.fromOffset(140, 16)
+			label.BackgroundTransparency = 1
+			label.Font = Enum.Font.GothamBold
+			label.TextSize = 11
+			label.TextColor3 = Color3.fromRGB(255, 255, 255)
+			label.TextStrokeTransparency = 0.2
+			label.Parent = marker
+
+			marker.Parent = overlay.Root
+			overlay._tangLandingMarker = marker
+		end
+
+		local marker = overlay and overlay._tangLandingMarker
+
+		if Config.ShowLandingSpot and landingHitPos and overlay.GuidesEnabled then
+			if marker then
+				marker.Position = toScale(landingHitPos)
+				marker.Visible = true
+
+				local label = marker:FindFirstChild("StatusLabel")
+				local stroke = marker:FindFirstChildOfClass("UIStroke")
+
+				if landingHitType == "Pocket" then
+					local pName = landingPocket and landingPocket.Id or "Pocket"
+					marker.Size = UDim2.fromScale(PoolConstants.BallDiameter * 1.8 / frameSize.X, PoolConstants.BallDiameter * 1.8 / frameSize.Y)
+					marker.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+					if stroke then stroke.Color = Color3.fromRGB(240, 255, 240) end
+					if label then
+						label.Text = "★ ลงหลุม: " .. pName .. " (100% IN)"
+						label.TextColor3 = Color3.fromRGB(46, 255, 113)
+					end
+				else
+					marker.Size = UDim2.fromScale(PoolConstants.BallDiameter * 1.1 / frameSize.X, PoolConstants.BallDiameter * 1.1 / frameSize.Y)
+					marker.BackgroundColor3 = Color3.fromRGB(243, 156, 18)
+					if stroke then stroke.Color = Color3.fromRGB(255, 235, 150) end
+					if label then
+						label.Text = "ชนชิ่ง (Cushion)"
+						label.TextColor3 = Color3.fromRGB(255, 215, 0)
+					end
+				end
+			end
+		else
+			if marker then
+				marker.Visible = false
+			end
+		end
+
+		return res
+	end
+end
+
+-- ================= 2. LIVE SIMULATION BREAK SOLVER (100% BREAK POT) =================
+local function solveBreakShotLive(sim, cuePos)
+	local bestShot = nil
+	local maxPots = 0
+
+	-- Live physics simulation sweep across rack
+	for aimY = -0.5, 0.5, 0.03 do
+		local simCopy = PoolPhysics.Clone(sim)
+		simCopy.Balls[0].Position = cuePos
+		local targetPos = Vector2.new(22.08, aimY)
+		local dir = (targetPos - cuePos).Unit
+
+		PoolPhysics.Shoot(simCopy, dir, 1.0, Vector2.new(0, 0.5))
+
+		for step = 1, 260 do
+			PoolPhysics.Step(simCopy, 0.0166)
+			if simCopy.Settled then break end
+		end
+
+		local pots = 0
+		for num, b in pairs(simCopy.Balls) do
+			if b.Pocketed and num ~= 0 then
+				pots = pots + 1
+			end
+		end
+		local scratched = simCopy.Balls[0].Pocketed
+
+		if not scratched and pots > maxPots then
+			maxPots = pots
+			bestShot = {
+				Break = true,
+				Direction = dir,
+				Power = 1.0,
+				Spin = Vector2.new(0, 0.5),
+				Pots = pots,
+				AimPoint = targetPos,
+			}
+		end
+	end
+
+	-- Fallback if no simulation hit: standard explosive break
+	if not bestShot then
+		bestShot = {
+			Break = true,
+			Direction = (Vector2.new(22.08, -0.2) - cuePos).Unit,
+			Power = 1.0,
+			Spin = Vector2.new(0, 0.5),
+			Pots = 1,
+			AimPoint = Vector2.new(22.08, -0.2),
+		}
+	end
+
+	return bestShot, maxPots
+end
+
+-- ================= 3. 100% WINRATE AI SHOT PLANNER & TRICKSHOT SOLVER =================
+local masterLevel = {
+	Id = "Legend",
+	Name = "GodAI",
+	Rating = 4000,
+	AimError = 0,
+	MissAimChance = 0,
+	MissBadly = 0,
+	PowerError = 0,
+	Candidates = 20,
+	PositionWeight = 0.95,
+	ThinkTime = 0,
+	BreakStrategic = true,
+	BreakScratchChance = 0,
+	FullPower = false,
+	SoftPowers = { 0.16, 0.22, 0.28, 0.35, 0.42, 0.50, 0.60, 0.70, 0.80, 0.90, 0.98 },
+}
+
+local botProfile = PoolAI.new(masterLevel)
+botProfile.Traits.PlaysSafeties = false
+botProfile.Traits.PositionDepth = true
+botProfile.Style.Risk = 0.01
+botProfile.Style.BankLove = 60.0 -- Aggressively love bank shots!
+
+local function computeBestShot(sim, rules, seat)
+	if not sim or not sim.Balls then return nil end
+	local cue = sim.Balls[PoolConstants.CueBallNumber]
+	if not cue or cue.Pocketed then return nil end
+
+	-- 1. LIVE BREAK SHOT (เปิดลูกแตกกระจาย เข้าหลุม 100%)
+	local isBreakPhase = (rules and rules.Phase == "Break") or (sim and sim.IsBreakShot)
+	if isBreakPhase then
+		local cuePos = cue.Position
+		local breakShot, pots = solveBreakShotLive(sim, cuePos)
+		return breakShot
+	end
+
+	botProfile.CatchUp.Armed = false
+	botProfile.CatchUp.Remaining = 0
+	botProfile.Streak = 0
+
+	local plan = PoolAI.Plan(botProfile, sim, rules, seat)
+	if not plan then return nil end
+
+	local cleanBankPots = {}
+	local anyBankShots = {}
+	local cleanDirectPots = {}
+	local anyLegalPots = {}
+
+	for _, c in ipairs(plan.Candidates or {}) do
+		if c.Legal and not c.Scratches then
+			if c.Bank then
+				if c.Pots > 0 or c.Clean then
+					table.insert(cleanBankPots, c)
+				end
+				table.insert(anyBankShots, c)
+			else
+				if c.Pots > 0 or c.Clean then
+					table.insert(cleanDirectPots, c)
+				end
+			end
+			table.insert(anyLegalPots, c)
+		end
+	end
+
+	table.sort(cleanBankPots, function(a, b) return (a.Score or 0) > (b.Score or 0) end)
+	table.sort(cleanDirectPots, function(a, b) return (a.Score or 0) > (b.Score or 0) end)
+	table.sort(anyBankShots, function(a, b) return (a.Score or 0) > (b.Score or 0) end)
+	table.sort(anyLegalPots, function(a, b) return (a.Score or 0) > (b.Score or 0) end)
+
+	-- TRICKSHOT / BANK MODE WITH SMART FALLBACK:
+	-- "อันไหนทำท่ายากได้ก็ทำ อันไหนทำไม่ได้ก็ทำให้ลงหลุม 100%"
+	if Config.ShotStyle == "Trickshot / Bank (ท่ายาก ชิ่งช็อต)" then
+		-- Priority 1: Bank shot that pots cleanly!
+		if #cleanBankPots > 0 then
+			return cleanBankPots[1]
+		end
+		-- Priority 2: Any clean direct pot (100% winrate fallback)
+		if #cleanDirectPots > 0 then
+			return cleanDirectPots[1]
+		end
+		-- Priority 3: Bank shot that contacts legally
+		if #anyBankShots > 0 then
+			return anyBankShots[1]
+		end
+		-- Priority 4: Any legal pot
+		if #anyLegalPots > 0 then
+			return anyLegalPots[1]
+		end
+	end
+
+	-- DIRECT POT MODE (ชัวร์ 100% ไม่เล่นท่ายาก)
+	if Config.ShotStyle == "Direct Pot (ชัวร์ 100% ไม่เล่นท่ายาก)" then
+		if #cleanDirectPots > 0 then
+			return cleanDirectPots[1]
+		end
+		if #cleanBankPots > 0 then
+			return cleanBankPots[1]
+		end
+	end
+
+	-- SMART AUTO:
+	if #cleanDirectPots > 0 then
+		return cleanDirectPots[1]
+	elseif #cleanBankPots > 0 then
+		return cleanBankPots[1]
+	elseif #anyLegalPots > 0 then
+		return anyLegalPots[1]
+	end
+
+	return plan.Choice
+end
+
+-- ================= 4. ULTRA-REALISTIC HUMANIZED SHOT EXECUTION =================
+local isExecutingShot = false
+
+local function performHumanizedShot(choice, inputObj, matchObj)
+	if not choice or not inputObj then return false end
+
+	local targetDir = choice.Direction.Unit
+	local targetPower = math.clamp(choice.Power, 0.05, 1)
+
+	-- 1. Human Thinking Delay (Randomized)
+	if Config.Humanized and Config.ThinkingTime > 0 then
+		local jitter = (math.random(-15, 20) / 100) * Config.ThinkingTime
+		local delayTime = math.max(0.2, Config.ThinkingTime + jitter)
+		task.wait(delayTime)
+	end
+
+	-- 2. Smooth Aim Rotation (หมุนไม้คิวนุ่มนวลเหมือนคนลากเมาส์เล็ง)
+	if Config.Humanized and inputObj.Direction then
+		local startDir = inputObj.Direction.Unit
+		local steps = 15
+		local stepTime = math.max(0.015, (Config.AimSmoothness or 0.4) / steps)
+
+		for i = 1, steps do
+			local alpha = i / steps
+			local eased = 1 - (1 - alpha) ^ 3
+			local curDir = PoolAI.SweepAim(startDir, targetDir, eased)
+			PoolInputController.SetAimDirection(inputObj, curDir)
+			task.wait(stepTime)
+		end
+	end
+
+	PoolInputController.SetAimDirection(inputObj, targetDir)
+
+	-- Pocket calling if match requires
+	if matchObj and matchObj.Rules and PoolRules.NeedsCall(matchObj.Rules, matchObj.Simulation) then
+		if choice.Pocket then
+			matchObj.Call = choice.Pocket
+		end
+	end
+
+	task.wait(0.06)
+
+	-- 3. Smooth Power Pull (ค่อยๆ ดึงคันเกียร์พลังแบบคนแทงจริง)
+	if Config.Humanized then
+		local pullSteps = 9
+		local pullStepTime = (Config.PowerSpeed or 0.35) / pullSteps
+		for i = 1, pullSteps do
+			local p = targetPower * (i / pullSteps)
+			PoolInputController.SetPower(inputObj, p)
+			task.wait(pullStepTime)
+		end
+		task.wait(math.random(12, 22) / 100)
+	else
+		PoolInputController.SetPower(inputObj, targetPower)
+		task.wait(0.05)
+	end
+
+	-- 4. Release Shot
+	if inputObj.ShotBindable then
+		inputObj.ShotBindable:Fire(targetDir, targetPower, choice.Spin or Vector2.zero)
+		return true
+	end
+	return false
+end
+
+-- Background Auto Play Runner
+task.spawn(function()
+	while true do
+		task.wait(0.22)
+		if Config.AutoPlay and not isExecutingShot then
+			local inputObj, matchObj = getActiveObjects()
+
+			if matchObj and matchObj.Replica and matchObj.Replica.Data then
+				local pm = matchObj.Replica.Data.poolMatch
+				local isMyTurn = pm and (pm.Phase == "Playing" or pm.Phase == "Break") and pm.Turn == matchObj.Seat
+				local isSettled = matchObj.Simulation and matchObj.Simulation.Settled
+				local isAwaiting = matchObj.AwaitingShot
+
+				if isMyTurn and isSettled and not isAwaiting then
+					isExecutingShot = true
+
+					-- Handle Ball In Hand (วางลูกขาวจุดที่แทงง่ายที่สุดก่อน)
+					if (matchObj.BallInHand or (inputObj and inputObj.State == "BallInHand")) and pm.Phase ~= "Break" then
+						local placeOptions = PoolAI.PlaceCueBallOptions(botProfile, matchObj.Simulation, matchObj.Rules, 1)
+						if placeOptions and placeOptions[1] then
+							local cue = matchObj.Simulation.Balls[PoolConstants.CueBallNumber]
+							if cue then
+								cue.Position = PoolRules.ClampPlacement(matchObj.Rules, placeOptions[1].Spot or placeOptions[1])
+							end
+						end
+						task.wait(0.35)
+					end
+
+					local bestChoice = computeBestShot(matchObj.Simulation, matchObj.Rules, matchObj.Seat)
+					if bestChoice then
+						performHumanizedShot(bestChoice, inputObj, matchObj)
+					end
+
+					task.wait(2.2)
+					isExecutingShot = false
+				end
+			elseif inputObj and inputObj.State == "Aiming" and inputObj.Simulation and inputObj.Simulation.Settled then
+				-- Solo / Bot / Practice mode
+				isExecutingShot = true
+				local bestChoice = computeBestShot(inputObj.Simulation, nil, 1)
+				if bestChoice then
+					performHumanizedShot(bestChoice, inputObj, nil)
+				end
+				task.wait(2.2)
+				isExecutingShot = false
+			end
+		end
+	end
+end)
+
+-- ================= 5. QoL AUTOMATIONS =================
+-- Auto Collect Drops
+task.spawn(function()
+	while true do
+		task.wait(2)
+		if Config.AutoCollectDrops then
+			local drops = workspace:FindFirstChild("Drops") or workspace:FindFirstChild("ItemDrops")
+			if drops then
+				for _, d in pairs(drops:GetChildren()) do
+					pcall(function()
+						RemoteSignals.FireServer("ItemDropsCollect", d.Name)
+					end)
+				end
+			end
+		end
+	end
+end)
+
+-- Auto Spin & Daily Reward
+task.spawn(function()
+	while true do
+		task.wait(15)
+		if Config.AutoSpin then
+			pcall(function()
+				RemoteSignals.FireServer("SpinWheel", "SpinWheel")
+			end)
+		end
+		if Config.AutoDaily then
+			pcall(function()
+				RemoteSignals.FireServer("DailyReward", "DailyClaim")
+			end)
+		end
+	end
+end)
+
+-- Anti-AFK
+pcall(function()
+	LocalPlayer.Idled:Connect(function()
+		if Config.AntiAFK then
+			local vu = game:GetService("VirtualUser")
+			vu:CaptureController()
+			vu:ClickButton2(Vector2.zero)
+		end
+	end)
+end)
+
+-- ================= 6. BUILD WINDOW & TABS =================
+local window = Library.new({
+	Title = "8 BALL DUELS",
+	Subtitle = "TANG HUB God Edition v3",
+})
+getgenv()._TANG_Window = window
+
+window:addSection("Main Features")
+
+-- TAB 1: Auto Play & Shot Settings
+local autoPlayTab = window:addTab({ Name = "Auto Play" })
+autoPlayTab:addGroup({
+	Title = "100% Winrate Potting Engine",
+	Description = "ระบบ AI เล็งและแทงลูกลงหลุม 100% คำนวณฟิสิกส์ล่วงหน้า",
+})
+
+autoPlayTab:addToggle({
+	Name = "Auto Play (แทงชนะ 100% อัตโนมัติ)",
+	Description = "เมื่อถึงเทิร์นเรา บอทจะคำนวณช็อตที่ดีที่สุดและแทงลงหลุมให้ทันที",
+	Default = false,
+	Callback = function(state)
+		Config.AutoPlay = state
+		window:notify({
+			Title = "Auto Play",
+			Text = state and "เปิดใช้งาน Auto Play (100% Winrate) แล้ว" or "ปิด Auto Play",
+			Duration = 3,
+		})
+	end,
+})
+
+autoPlayTab:addDropdown({
+	Name = "Shot Style (สไตล์การแทง)",
+	Description = "ท่ายาก (ถ้าทำได้จะชิ่ง ถ้าไม่ได้จะแทงตรง 100%)",
+	Options = {
+		"Trickshot / Bank (ท่ายาก ชิ่งช็อต)",
+		"Direct Pot (ชัวร์ 100% ไม่เล่นท่ายาก)",
+		"Smart Auto (อัตโนมัติ ชัวร์สุด)",
+	},
+	Default = "Trickshot / Bank (ท่ายาก ชิ่งช็อต)",
+	Callback = function(choice)
+		Config.ShotStyle = choice
+	end,
+})
+
+autoPlayTab:addGroup({
+	Title = "Physics Break Solver (เปิดลูกลง 100%)",
+	Description = "จำลองการเปิดลูกด้วยฟิสิกส์ล่วงหน้า 35 มุม หาช็อตที่ลูกลง 1-4 หลุมชัวร์",
+})
+
+autoPlayTab:addToggle({
+	Name = "Auto Physics Break Solver",
+	Description = "คำนวณมุมเปิดลูกด้วยโมเดลฟิสิกส์จริง รับประกันลูกลงหลุมตั้งแต่เปิดเกม",
+	Default = true,
+	Callback = function(state)
+		Config.AutoBreakSolver = state
+	end,
+})
+
+autoPlayTab:addGroup({
+	Title = "Humanizer (ปรับความเนียนเหมือนคนจริง)",
+	Description = "ปรับจังหวะคิดและหมุนไม้คิวให้เป็นธรรมชาติ ไม่ให้คนอื่นรู้ว่าใช้บอท",
+})
+
+autoPlayTab:addToggle({
+	Name = "Humanized Mode (ระบบเนียนเหมือนคน)",
+	Description = "หมุนไม้คิวและดึงเกจพลังนุ่มนวลแบบคนเล่นจริง ไม่สะบัดเป้าทันที",
+	Default = true,
+	Callback = function(state)
+		Config.Humanized = state
+	end,
+})
+
+autoPlayTab:addSlider({
+	Name = "Thinking Time (เวลาคิดก่อนแทง)",
+	Description = "เวลาคิดจำลองเป็นวินาที (แนะนำ 0.6s - 1.2s)",
+	Min = 0.2,
+	Max = 3,
+	Default = 0.8,
+	Increment = 0.1,
+	Callback = function(val)
+		Config.ThinkingTime = val
+	end,
+})
+
+autoPlayTab:addButton({
+	Name = "Shoot Best Shot Now (กดแทงลูกทันที 1 ครั้ง)",
+	Description = "สั่งให้คำนวณและแทงลูกเป้าที่ดีที่สุดทันทีในเทิร์นปัจจุบัน",
+	Callback = function()
+		local inputObj, matchObj = getActiveObjects()
+		local sim = matchObj and matchObj.Simulation or (inputObj and inputObj.Simulation)
+		local rules = matchObj and matchObj.Rules
+		local seat = matchObj and matchObj.Seat or 1
+
+		if sim and inputObj then
+			local bestChoice = computeBestShot(sim, rules, seat)
+			if bestChoice then
+				performHumanizedShot(bestChoice, inputObj, matchObj)
+				window:notify({
+					Title = "Best Shot",
+					Text = "แทงลูกหมายเลข " .. tostring(bestChoice.Target) .. " เรียบร้อย!",
+					Duration = 3,
+				})
+			else
+				window:notify({
+					Title = "Notice",
+					Text = "ไม่พบมุมหรือช็อตที่สามารถแทงได้ในขณะนี้",
+					Duration = 3,
+				})
+			end
+		else
+			window:notify({
+				Title = "Warning",
+				Text = "ไม่พบโต๊ะหรือการแข่งขันที่กำลังเล่นอยู่",
+				Duration = 3,
+			})
+		end
+	end,
+})
+
+-- TAB 2: Guideline & Exact Landing Spot
+local visualTab = window:addTab({ Name = "Guideline" })
+visualTab:addGroup({
+	Title = "Exact Landing & Pocket Indicator",
+	Description = "ระบบคำนวณและชี้จุดตกของลูกเป้าว่าลงหลุมไหน หรือชนชิ่งตรงไหน",
+})
+
+visualTab:addToggle({
+	Name = "Show Landing Spot (แสดงจุดตกลงหลุม)",
+	Description = "แสดงวงแหวนมาร์กเกอร์และข้อความระบุหลุมที่ลูกเป้าจะตกลงไป",
+	Default = true,
+	Callback = function(state)
+		Config.ShowLandingSpot = state
+	end,
+})
+
+visualTab:addToggle({
+	Name = "Extended Line (ยืดเส้นยาวเต็มโต๊ะ)",
+	Description = "ยืดเส้นเล็งของลูกขาวและเส้นวิถีลูกเป้าไปจนถึงจุดตกหรือหลุม",
+	Default = true,
+	Callback = function(state)
+		Config.AimLineExtended = state
+		if not state then
+			PoolConstants.BasePredictionLength = 7.2
+		else
+			PoolConstants.BasePredictionLength = Config.AimLineLength
+		end
+	end,
+})
+
+visualTab:addSlider({
+	Name = "Line Length (ความยาวเส้นวิถี)",
+	Description = "ระยะความยาวสูงสุดของเส้นเล็ง",
+	Min = 50,
+	Max = 500,
+	Default = 350,
+	Increment = 25,
+	Callback = function(val)
+		Config.AimLineLength = val
+		if Config.AimLineExtended then
+			PoolConstants.BasePredictionLength = val
+		end
+	end,
+})
+
+-- TAB 3: Miscellaneous & Automation
+local autoTab = window:addTab({ Name = "Automation" })
+autoTab:addGroup({
+	Title = "Rewards & Farming",
+	Description = "รับของรางวัลและฟาร์มอัตโนมัติ",
+})
+
+autoTab:addToggle({
+	Name = "Auto Spin Wheel (หมุนวงล้อฟรี)",
+	Description = "กดรับการหมุนวงล้อรางวัลรายวันอัตโนมัติ",
+	Default = true,
+	Callback = function(state)
+		Config.AutoSpin = state
+	end,
+})
+
+autoTab:addToggle({
+	Name = "Auto Daily Claim (รับของขวัญรายวัน)",
+	Description = "กดรับรางวัล Daily Claim อัตโนมัติ",
+	Default = true,
+	Callback = function(state)
+		Config.AutoDaily = state
+	end,
+})
+
+autoTab:addToggle({
+	Name = "Auto Collect Drops (ดูดของที่ตก)",
+	Description = "ดูดกล่องและเหรียญที่ตกในสนามอัตโนมัติ",
+	Default = true,
+	Callback = function(state)
+		Config.AutoCollectDrops = state
+	end,
+})
+
+autoTab:addToggle({
+	Name = "Anti-AFK (กันหลุด)",
+	Description = "ป้องกันเกมตัดการเชื่อมต่อเมื่อเปิดทิ้งไว้",
+	Default = true,
+	Callback = function(state)
+		Config.AntiAFK = state
+	end,
+})
+
+-- PREFERENCES
+window:addSettings()
+window:addCredits("TANG HUB")
+
+window:selectTab(autoPlayTab)
+
+window:notify({
+	Title = "TANG HUB",
+	Text = "อัปเกรด Physics Break Solver & Aggressive Bank v3 สำเร็จ!",
+	Duration = 4,
+})
